@@ -1,0 +1,67 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pulsewise"
+version = "0.1.0"
+description = "AI-native event middleware — Python client SDK"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+authors = [
+    { name = "Wise World" },
+]
+keywords = ["analytics", "ai", "events", "observability"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+
+# SDK runtime deps only. The service (FastAPI/psycopg/anthropic) is NOT
+# shipped — those live in requirements.txt for the deployed services.
+dependencies = [
+    "httpx>=0.27.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/wiseworld/pulsewise"
+
+# Build the SDK + schema only. Service modules (ingestion/, aggregation/,
+# dashboard/, config/, ingestion/db.py, etc.) are excluded — they are not
+# meant to be imported by consumers.
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["pulsewise*", "sdk*", "core*"]
+exclude = [
+    "tests*",
+    "ingestion*",
+    "aggregation*",
+    "dashboard*",
+    "config*",
+    "migrations*",
+    "scripts*",
+    "data*",
+    "docs_to_claude*",
+]
+
+# Make the package layout explicit. setuptools needs to find:
+#   pulsewise/__init__.py          — the public shim
+#   sdk/python/pulsewise.py        — the SDK implementation
+#   core/event_schema.py           — the schema
+# All three are pure Python; no package_data needed.
+[tool.setuptools.package-dir]
+"" = "."
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

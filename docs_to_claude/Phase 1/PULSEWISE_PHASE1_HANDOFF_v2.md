@@ -1,0 +1,688 @@
+# PulseWise — Phase 1 Technical Handoff
+**For:** Claude Code  
+**Date:** March 26, 2026  
+**Thread:** PULSEWISE-001  
+
+---
+
+## Quick Reference
+
+| Field | Value |
+|---|---|
+| Project | `pulsewise` — standalone middleware repo, deployed as its own Railway service |
+| Scope | Phase 1: Core event ingestion pipeline + SDK + circuit breaker + internal dashboard |
+| Prerequisite | Python 3.11+, PostgreSQL, Redis, `ANTHROPIC_API_KEY` |
+| Deployment | Railway service — own PostgreSQL + Redis, independent of all other Wise World services |
+| First consumers | VoiceWise and Hopwise (internal only in Phase 1 — no external SDK publishing yet) |
+| **Do NOT** | Build generic analytics (Mixpanel clone). PulseWise captures AI-native events only. |
+
+---
+
+## 1. Context & Problem
+
+Every Wise World product generates rich behavioral signal that currently disappears:
+
+- **Hopwise** knows which recommendations users ignored, what destinations convert, how long trip planning takes
+- **VoiceWise** knows latency profiles, provider failure rates, which accent detection confidence thresholds cause drop-offs
+- **HelmerWise** (future) will know which prompts generate retries, which video styles get exported vs. abandoned
+- **ScriptWise** (future) will know which briefs get clicked, which genres convert to access requests
+
+None of this feeds back into product decisions or into the AI models making recommendations.
+
+The correct architecture is an **AI-native event middleware** — not a generic click tracker, but a system that understands the semantic meaning of events in AI-powered products. A "low confidence voice transcription" is a fundamentally different event than a "button click" and should be captured, stored, and surfaced differently.
+
+**PulseWise captures events with intent context, not just raw actions.**
+
+> **DESIGN PRINCIPLE:** Every event has three layers: what happened (action), why it happened (intent context), and what the AI decided (model context). Standard analytics tools only capture the first. PulseWise captures all three.
+
+---
+
+## 2. Architecture Overview
+
+Five modules, implemented in order.
+
+| Phase | Module | What It Builds | Output |
+|---|---|---|---|
+| 1A | `core/event_schema.py` | Canonical event schema with AI-native fields | `PulseEvent` dataclass + validators |
+| 1B | `ingestion/collector.py` | HTTP ingestion endpoint that receives events from SDKs | Running FastAPI endpoint, events stored in PostgreSQL |
+| 1C | `sdk/python/pulsewise.py` | Lightweight Python SDK — drop-in for Hopwise and VoiceWise | `pip install pulsewise` sends events in < 5ms overhead |
+| 1D | `aggregation/summarizer.py` | Periodic aggregation job — rolls up raw events into product insights | `insights_summary.json` per product per day |
+| 1E | `dashboard/pulse_dashboard.py` | Internal ops dashboard showing live event streams + insights | Viewable HTML dashboard |
+
+---
+
+## 3. Railway Deployment Architecture
+
+PulseWise runs as a fully independent Railway service — it shares no infrastructure with VoiceWise, Hopwise, or any other product. Each product connects to it via a single environment variable.
+
+### Service Layout on Railway
+
+```
+Railway Project: wise-world
+├── voicewise          (existing)  → adds PULSEWISE_URL env var
+├── hopwise            (existing)  → adds PULSEWISE_URL env var
+├── pulsewise          (NEW)
+│   ├── web service    — FastAPI collector (Phase 1B)
+│   ├── PostgreSQL     — pulse_events table
+│   └── Redis          — event buffer
+└── ... other products (future)   → add PULSEWISE_URL when ready
+```
+
+### Why This Deployment Model
+
+All Wise World products are already separate Railway services. Adding PulseWise as one more service is ~30 minutes of Railway setup and immediately gives the correct architecture. No product ever depends on another product's infrastructure to emit events.
+
+The value of PulseWise compounds with the number of products feeding it. If it were embedded in VoiceWise, Hopwise would have to call VoiceWise just to log a travel recommendation event — that coupling is architecturally wrong and breaks the zero-overhead contract.
+
+### Integration Pattern for Each Consumer
+
+Every product that integrates PulseWise needs exactly **one new environment variable and one SDK import**:
+
+```bash
+# Added to VoiceWise's Railway env vars
+PULSEWISE_URL=https://pulsewise-production.railway.app
+PULSEWISE_ENABLED=true
+```
+
+```python
+# Added to VoiceWise at startup (e.g. main.py or app factory)
+from pulsewise import PulseClient
+pulse = PulseClient(
+    product="voicewise",
+    collector_url=settings.PULSEWISE_URL,
+    async_mode=True,
+    enabled=settings.PULSEWISE_ENABLED,
+)
+```
+
+That's the entire integration surface. No schema changes to VoiceWise, no new dependencies, no shared code.
+
+### Failure Isolation
+
+If PulseWise's Railway service goes down:
+- VoiceWise continues operating normally — SDK circuit breaker activates, events dropped silently
+- Hopwise continues operating normally — same circuit breaker behaviour
+- No user impact, no degraded mode in any consumer
+- PulseWise restarts on Railway, consumers resume emitting automatically
+
+---
+
+## 4. Phase 1A — Event Schema
+
+### What It Does
+
+Defines the canonical `PulseEvent` dataclass. This is the contract that all SDKs, all products, and all aggregation logic must conform to. Getting this right in Phase 1A means everything downstream is consistent.
+
+The schema has three layers:
+
+1. **Base fields** — present on every event regardless of product
+2. **AI context fields** — model used, confidence scores, provider, latency
+3. **Product context fields** — product-specific payload (freeform dict, validated by product)
+
+### File
+
+```
+core/event_schema.py
+```
+
+### PulseEvent Schema
+
+```python
+from dataclasses import dataclass, field
+from typing import Optional, Any
+from datetime import datetime
+import uuid
+
+@dataclass
+class PulseEvent:
+    # --- Base fields (required on every event) ---
+    event_id:       str              # uuid4, generated by SDK if not provided
+    product:        str              # 'hopwise' | 'voicewise' | 'helmerwise' | 'scriptwise'
+    event_type:     str              # see EventType enum below
+    timestamp:      datetime         # UTC, set by SDK at capture time
+    session_id:     str              # groups events within a user session
+    user_id:        Optional[str]    # hashed/anonymized — never raw PII
+
+    # --- AI context fields (present when an AI model was involved) ---
+    model_name:     Optional[str]    # e.g. 'claude-sonnet-4', 'whisper-large-v3'
+    model_provider: Optional[str]    # 'anthropic' | 'openai' | 'google' | 'deepgram'
+    confidence:     Optional[float]  # 0.0-1.0 model confidence if available
+    latency_ms:     Optional[int]    # end-to-end latency for this AI call
+    tokens_used:    Optional[int]    # for LLM calls
+    cost_usd:       Optional[float]  # computed cost for this call
+
+    # --- Outcome fields ---
+    outcome:        str              # 'success' | 'failure' | 'ignored' | 'retry'
+    error_code:     Optional[str]    # if outcome='failure', why
+    retry_count:    int = 0          # how many retries before this outcome
+
+    # --- Product payload ---
+    context:        dict = field(default_factory=dict)  # product-specific data
+    tags:           list[str] = field(default_factory=list)  # freeform labels
+```
+
+### EventType Enum
+
+```python
+from enum import Enum
+
+class EventType(str, Enum):
+    # Voice events (VoiceWise)
+    VOICE_TRANSCRIPTION    = "voice.transcription"
+    VOICE_SYNTHESIS        = "voice.synthesis"
+    VOICE_ROUTING_DECISION = "voice.routing_decision"
+    VOICE_PROVIDER_FALLBACK = "voice.provider_fallback"
+
+    # Recommendation events (Hopwise, future products)
+    RECOMMENDATION_SHOWN   = "recommendation.shown"
+    RECOMMENDATION_CLICKED = "recommendation.clicked"
+    RECOMMENDATION_IGNORED = "recommendation.ignored"
+    RECOMMENDATION_SAVED   = "recommendation.saved"
+
+    # Content generation events (HelmerWise)
+    GENERATION_STARTED     = "generation.started"
+    GENERATION_COMPLETED   = "generation.completed"
+    GENERATION_RETRIED     = "generation.retried"
+    GENERATION_ABANDONED   = "generation.abandoned"
+
+    # Discovery events (ScriptWise)
+    CONTENT_VIEWED         = "content.viewed"
+    CONTENT_REQUESTED      = "content.requested"
+    CONTENT_DECLINED       = "content.declined"
+
+    # Agent events (AgentWise)
+    AGENT_TASK_STARTED     = "agent.task_started"
+    AGENT_TASK_COMPLETED   = "agent.task_completed"
+    AGENT_TASK_BLOCKED     = "agent.task_blocked"
+
+    # Generic
+    CUSTOM                 = "custom"
+```
+
+### Validation Rules
+
+```python
+VALID_PRODUCTS = {'hopwise', 'voicewise', 'helmerwise', 'scriptwise', 'agentwise'}
+
+def validate_event(event: PulseEvent) -> list[str]:
+    """Returns list of validation errors. Empty list = valid."""
+    errors = []
+    if event.product not in VALID_PRODUCTS:
+        errors.append(f"Unknown product: {event.product}")
+    if not 0.0 <= (event.confidence or 0.5) <= 1.0:
+        errors.append("confidence must be 0.0-1.0")
+    if event.outcome not in {'success', 'failure', 'ignored', 'retry'}:
+        errors.append(f"Invalid outcome: {event.outcome}")
+    if event.cost_usd and event.cost_usd < 0:
+        errors.append("cost_usd cannot be negative")
+    return errors
+```
+
+---
+
+## 5. Phase 1B — Ingestion Collector
+
+### What It Does
+
+A FastAPI service that receives `PulseEvent` objects from SDKs (HTTP POST), validates them, and persists them to PostgreSQL. Also exposes a health check and a simple query endpoint for the dashboard.
+
+Designed for low overhead — events must be written with < 10ms added latency from the SDK's perspective (async fire-and-forget from the SDK side).
+
+### File
+
+```
+ingestion/collector.py
+```
+
+### Endpoints
+
+```
+POST   /events          — ingest one or more events (batch supported)
+GET    /health          — health check, returns DB connection status
+GET    /events/recent   — last N events for a product (dashboard use)
+GET    /insights/{product} — latest aggregated insights for a product
+```
+
+### Database Schema
+
+```sql
+CREATE TABLE pulse_events (
+    event_id        UUID PRIMARY KEY,
+    product         VARCHAR(32) NOT NULL,
+    event_type      VARCHAR(64) NOT NULL,
+    timestamp       TIMESTAMPTZ NOT NULL,
+    session_id      VARCHAR(64) NOT NULL,
+    user_id         VARCHAR(64),          -- hashed, never raw PII
+    model_name      VARCHAR(64),
+    model_provider  VARCHAR(32),
+    confidence      FLOAT,
+    latency_ms      INTEGER,
+    tokens_used     INTEGER,
+    cost_usd        DECIMAL(10, 6),
+    outcome         VARCHAR(16) NOT NULL,
+    error_code      VARCHAR(64),
+    retry_count     INTEGER DEFAULT 0,
+    context         JSONB,
+    tags            TEXT[],
+    ingested_at     TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Indexes for common query patterns
+CREATE INDEX idx_events_product_timestamp ON pulse_events(product, timestamp DESC);
+CREATE INDEX idx_events_event_type ON pulse_events(event_type);
+CREATE INDEX idx_events_outcome ON pulse_events(outcome);
+CREATE INDEX idx_events_session ON pulse_events(session_id);
+```
+
+### Batch Ingestion
+
+```python
+# POST /events accepts both single event and array
+# Single:  {"event_id": "...", "product": "voicewise", ...}
+# Batch:   [{"event_id": "..."}, {"event_id": "..."}]
+# Max batch size: 100 events per request
+# Returns: {"accepted": N, "rejected": M, "errors": [...]}
+```
+
+### Redis Buffer (Phase 1B optional, Phase 2 required)
+
+For high-frequency products (VoiceWise can generate 10+ events/minute per active session), buffer events in Redis before writing to PostgreSQL in micro-batches:
+
+```
+Redis list key: pulse:buffer:{product}
+Flush interval: 2 seconds or 50 events, whichever comes first
+Flusher: background asyncio task in the collector
+```
+
+---
+
+## 6. Phase 1C — Python SDK
+
+### What It Does
+
+A lightweight Python client that any Wise World product can import to emit events. The SDK must be zero-friction to adopt — a developer should be able to add PulseWise tracking to an existing endpoint in under 5 minutes.
+
+### File
+
+```
+sdk/python/pulsewise.py
+```
+
+### Circuit Breaker — Required
+
+Silent drop on individual failures is not enough. Without a circuit breaker, every VoiceWise request will silently wait for an httpx timeout on every event emission when PulseWise is unreachable — this will destroy latency numbers even with async mode, because timeouts still consume thread/task resources.
+
+Claude Code must implement a circuit breaker with three states:
+
+```python
+class CircuitState(Enum):
+    CLOSED   = "closed"    # normal — events flow through
+    OPEN     = "open"      # PulseWise unreachable — drop all events immediately, no network attempt
+    HALF_OPEN = "half_open" # cooldown elapsed — send one probe event to test recovery
+
+class CircuitBreaker:
+    FAILURE_THRESHOLD = 5        # consecutive failures before opening
+    COOLDOWN_SECONDS  = 60       # how long to stay OPEN before trying again
+
+    def __init__(self):
+        self.state          = CircuitState.CLOSED
+        self.failure_count  = 0
+        self.opened_at      = None
+
+    def record_success(self):
+        self.failure_count = 0
+        self.state = CircuitState.CLOSED
+
+    def record_failure(self):
+        self.failure_count += 1
+        if self.failure_count >= self.FAILURE_THRESHOLD:
+            self.state     = CircuitState.OPEN
+            self.opened_at = time.monotonic()
+
+    def allow_request(self) -> bool:
+        if self.state == CircuitState.CLOSED:
+            return True
+        if self.state == CircuitState.OPEN:
+            if time.monotonic() - self.opened_at >= self.COOLDOWN_SECONDS:
+                self.state = CircuitState.HALF_OPEN
+                return True   # allow one probe
+            return False      # still in cooldown — drop immediately
+        # HALF_OPEN: allow the probe through
+        return True
+```
+
+The `PulseClient.track()` method checks `circuit_breaker.allow_request()` before any network attempt. If `False`, the event is dropped with zero latency impact.
+
+### SDK Design Contract
+
+```python
+# Initialization — done once at app startup
+from pulsewise import PulseClient
+
+pulse = PulseClient(
+    product="voicewise",
+    collector_url=settings.PULSEWISE_URL,  # e.g. https://pulse.wiseworld.ai
+    async_mode=True,    # fire-and-forget, never blocks
+    batch_size=10,      # buffer locally, flush every 10 events or 1 second
+    enabled=settings.PULSEWISE_ENABLED,  # False in local dev, True in production
+)
+
+# Usage — emit an event
+pulse.track(
+    event_type=EventType.VOICE_TRANSCRIPTION,
+    session_id=session.id,
+    user_id=hash_user_id(user.id),   # SDK never receives raw PII
+    outcome="success",
+    model_name="whisper-large-v3",
+    model_provider="deepgram",
+    confidence=0.94,
+    latency_ms=312,
+    context={
+        "accent_detected": "british",
+        "accent_confidence": 0.87,
+        "audio_duration_ms": 4200,
+    }
+)
+```
+
+### SDK Implementation Rules
+
+- `async_mode=True` must never block the calling thread — use `asyncio.create_task` or a background thread queue
+- If the collector is unreachable, events are dropped silently — **never raise in the calling product**
+- SDK adds `event_id` (uuid4) and `timestamp` (UTC now) automatically if not provided
+- `enabled=False` must be a complete no-op — not even a network attempt
+- Local buffering: hold up to `batch_size` events in memory, flush on interval or size threshold
+- The SDK has zero required dependencies beyond Python stdlib + `httpx` for async HTTP
+
+### VoiceWise Integration Example
+
+```python
+# In VoiceWise: agents/voice_pipeline.py — add after provider call
+pulse.track(
+    event_type=EventType.VOICE_ROUTING_DECISION,
+    session_id=call_id,
+    outcome="success",
+    model_provider=selected_provider,
+    latency_ms=routing_latency,
+    cost_usd=estimated_cost,
+    context={
+        "providers_evaluated": provider_scores,
+        "routing_reason": routing_reason,
+        "cache_hit": was_cached,
+    }
+)
+```
+
+### Hopwise Integration Example
+
+```python
+# In Hopwise: after a recommendation is surfaced to user
+pulse.track(
+    event_type=EventType.RECOMMENDATION_SHOWN,
+    session_id=trip_session_id,
+    outcome="success",
+    confidence=recommendation_score,
+    context={
+        "recommendation_type": "restaurant",
+        "destination": destination_city,
+        "position_in_list": rank,
+        "filters_applied": active_filters,
+    }
+)
+```
+
+---
+
+## 7. Phase 1D — Aggregation Summarizer
+
+### What It Does
+
+A scheduled job (runs every hour, or on-demand via CLI) that reads raw events from PostgreSQL and produces a structured insights summary per product. This is where one Claude call is used — to generate human-readable observations from the aggregated metrics.
+
+### File
+
+```
+aggregation/summarizer.py
+```
+
+### Aggregation Output Schema
+
+```python
+@dataclass
+class ProductInsights:
+    product:            str
+    period_start:       datetime
+    period_end:         datetime
+    
+    # Volume metrics
+    total_events:       int
+    events_by_type:     dict[str, int]
+    active_sessions:    int
+    
+    # AI performance metrics
+    avg_latency_ms:     Optional[float]
+    p95_latency_ms:     Optional[float]
+    avg_confidence:     Optional[float]
+    total_cost_usd:     Optional[float]
+    
+    # Outcome metrics
+    success_rate:       float           # 0.0-1.0
+    failure_rate:       float
+    retry_rate:         float
+    
+    # Anomalies detected by aggregator
+    anomalies:          list[str]       # e.g. "p95 latency 40% above 7-day average"
+    
+    # Claude-generated narrative (one Claude call per product per run)
+    narrative:          str             # 3-5 sentences: what happened, what's notable
+    recommendations:    list[str]       # 2-3 actionable observations
+```
+
+### Aggregation SQL Queries
+
+```sql
+-- Success rate by event type (last 24h)
+SELECT 
+    event_type,
+    COUNT(*) as total,
+    SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END) as successes,
+    AVG(latency_ms) as avg_latency,
+    PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY latency_ms) as p95_latency,
+    AVG(confidence) as avg_confidence,
+    SUM(cost_usd) as total_cost
+FROM pulse_events
+WHERE product = %s
+  AND timestamp > NOW() - INTERVAL '24 hours'
+GROUP BY event_type;
+```
+
+### Claude Call for Narrative
+
+One Claude call per product per aggregation run:
+
+```python
+system = """You are a product analytics advisor for an AI startup. 
+Given aggregated metrics from the last 24 hours, write:
+1. A 3-5 sentence narrative describing what happened and what's notable
+2. 2-3 specific, actionable recommendations
+
+Be concrete — reference actual numbers. Flag anomalies clearly.
+Return ONLY JSON: {"narrative": "...", "recommendations": ["...", "..."]}"""
+
+user = f"""
+Product: {product}
+Period: {period_start} to {period_end}
+
+Metrics:
+{json.dumps(metrics_dict, indent=2)}
+
+Anomalies detected:
+{json.dumps(anomalies, indent=2)}
+"""
+```
+
+---
+
+## 8. Phase 1E — Internal Dashboard
+
+### What It Does
+
+A simple internal dashboard showing live event streams and daily insights per product. Reads from `dashboard_data.json` generated by the summarizer. Not a customer-facing product — this is the PulseWise ops view for internal Wise World use.
+
+### File
+
+```
+dashboard/pulse_dashboard.py   # generates dashboard_data.json
+dashboard/index.html           # static HTML, reads dashboard_data.json
+```
+
+### Dashboard Views
+
+- **Live Feed** — last 50 events across all products, color-coded by outcome
+- **Product Health** — success rate, avg latency, cost/hour per product (auto-refreshes every 60s)
+- **Insights** — latest Claude-generated narrative + recommendations per product
+- **Anomalies** — any flagged anomalies highlighted in red
+
+---
+
+## 9. Final File Structure
+
+```
+pulsewise/
+├── core/
+│   ├── __init__.py
+│   └── event_schema.py          ← Phase 1A (NEW)
+├── ingestion/
+│   ├── __init__.py
+│   └── collector.py             ← Phase 1B (NEW) — FastAPI service
+├── sdk/
+│   └── python/
+│       ├── __init__.py
+│       └── pulsewise.py         ← Phase 1C (NEW) — client SDK
+├── aggregation/
+│   ├── __init__.py
+│   └── summarizer.py            ← Phase 1D (NEW) — hourly job
+├── dashboard/
+│   ├── pulse_dashboard.py       ← Phase 1E (NEW) — generates dashboard_data.json
+│   └── index.html               ← Phase 1E (NEW) — static ops dashboard
+├── config/
+│   └── settings.py              ← env vars
+├── migrations/
+│   └── 001_initial_schema.sql   ← Phase 1B — DB schema
+├── tests/
+│   ├── test_event_schema.py
+│   ├── test_collector.py
+│   └── test_sdk.py
+└── .env.example
+```
+
+---
+
+## 10. Environment Variables
+
+```bash
+# Required — PulseWise service itself (set in Railway)
+ANTHROPIC_API_KEY=your_key_here
+DATABASE_URL=postgresql://user:pass@railway-postgres/pulsewise
+REDIS_URL=redis://railway-redis:6379/0
+
+# Service config
+PULSEWISE_PORT=8400
+PULSEWISE_ENV=production    # 'production' | 'staging' | 'development'
+
+# Aggregation
+AGGREGATION_INTERVAL_MINUTES=60
+AGGREGATION_LOOKBACK_HOURS=24
+
+# ── Added to CONSUMER products on Railway (VoiceWise, Hopwise, etc.) ──
+PULSEWISE_URL=https://pulsewise-production.railway.app   # PulseWise Railway URL
+PULSEWISE_ENABLED=true     # Set false in local dev to disable all tracking
+
+# Circuit breaker tuning (optional overrides — defaults shown)
+PULSEWISE_CIRCUIT_FAILURE_THRESHOLD=5    # failures before opening
+PULSEWISE_CIRCUIT_COOLDOWN_SECONDS=60   # seconds before retry
+```
+
+---
+
+## 11. Testing Checklist
+
+### Phase 1A — Event Schema
+- [ ] `PulseEvent` instantiates with all required fields
+- [ ] `validate_event()` catches invalid product, outcome, confidence out of range
+- [ ] All `EventType` values are valid strings usable as DB values
+
+### Phase 1B — Collector
+- [ ] `POST /events` accepts single event and batch of 10
+- [ ] Invalid events return 422 with clear error message
+- [ ] Events appear in PostgreSQL within 100ms of POST
+- [ ] `GET /health` returns DB connection status correctly
+- [ ] Collector handles DB connection failure gracefully (returns 503, does not crash)
+
+### Phase 1C — SDK
+- [ ] `pulse.track()` in async mode never blocks calling thread (verify with timing)
+- [ ] `enabled=False` is a complete no-op — no network activity
+- [ ] If collector is unreachable, SDK drops events silently — no exception raised
+- [ ] Batch flush sends events within 1 second of buffer threshold
+- [ ] **Circuit breaker opens after 5 consecutive failures**
+- [ ] **Circuit breaker in OPEN state drops events with zero network attempt (verify with timing — must be < 1ms)**
+- [ ] **Circuit breaker transitions to HALF_OPEN after 60 second cooldown**
+- [ ] **Circuit breaker closes again after a successful probe in HALF_OPEN state**
+- [ ] VoiceWise integration example runs without modifying VoiceWise core logic
+
+### Phase 1D — Summarizer
+- [ ] Aggregation SQL runs against PostgreSQL without error
+- [ ] Anomaly detection flags p95 latency > 40% above 7-day average
+- [ ] Claude call returns valid JSON with `narrative` and `recommendations`
+- [ ] `insights_summary.json` is written per product
+
+### Phase 1E — Dashboard
+- [ ] Dashboard loads and shows last 50 events
+- [ ] Auto-refresh updates product health every 60 seconds
+- [ ] Anomalies section shows red highlights correctly
+
+---
+
+## 12. Hard Constraints
+
+```
+AI-NATIVE EVENTS ONLY
+  PulseWise is not a generic click tracker. Every event must have meaningful
+  AI context (model, confidence, latency, cost) or a clear reason it doesn't.
+  Do not add generic UI events with no AI signal.
+
+NEVER STORE RAW PII
+  user_id must always be hashed before reaching the SDK.
+  The SDK must never accept or log email addresses, names, or phone numbers.
+  context dict must not contain PII — document this clearly in SDK README.
+
+ZERO OVERHEAD CONTRACT + CIRCUIT BREAKER
+  async_mode=True must never add latency to the calling product.
+  Silent drop on single failures is not enough — the SDK must implement a
+  circuit breaker. After 5 consecutive failures, the circuit opens and all
+  subsequent track() calls return immediately with no network attempt.
+  Circuit resets after 60 second cooldown. This protects VoiceWise and Hopwise
+  latency even during extended PulseWise outages.
+
+STANDALONE RAILWAY SERVICE — NO SHARED INFRASTRUCTURE
+  PulseWise has its own Railway service, its own PostgreSQL, its own Redis.
+  It shares no database and no infrastructure with any other Wise World product.
+  Consumer products connect via PULSEWISE_URL env var only.
+
+ONE CLAUDE CALL PER PRODUCT PER AGGREGATION RUN
+  The summarizer makes exactly one Claude call per product.
+  Raw event queries are pure SQL — no LLM involvement.
+```
+
+---
+
+## 13. Success Criteria
+
+Phase 1 is complete when all of the following are true:
+
+- [ ] VoiceWise emits `voice.transcription` and `voice.routing_decision` events with no measurable latency impact
+- [ ] Hopwise emits `recommendation.shown` and `recommendation.ignored` events
+- [ ] `python aggregation/summarizer.py` produces a `ProductInsights` object with a Claude-generated narrative for both products
+- [ ] Internal dashboard shows live event feed and daily insights for both products
+- [ ] Turning off PulseWise (`PULSEWISE_ENABLED=false`) has zero effect on VoiceWise or Hopwise behavior
+- [ ] No raw PII appears anywhere in the `pulse_events` table

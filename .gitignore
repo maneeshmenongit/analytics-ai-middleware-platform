@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.pytest_cache/
+.DS_Store
+
+# Build artifacts (pyproject.toml)
+build/
+dist/
+*.whl
+*.tar.gz
+
+# Runtime artifacts written by summarizer / dashboard generator
+data/insights_summary.json
+data/dashboard_data.json
+data/.insights_*.tmp
+data/.dashboard_*.tmp

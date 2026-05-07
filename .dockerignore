@@ -1,0 +1,27 @@
+# Don't bake local artifacts or secrets into the image.
+.git
+.gitignore
+.venv
+venv
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.DS_Store
+
+# Local-only state
+.env
+data/insights_summary.json
+data/dashboard_data.json
+data/.insights_*.tmp
+data/.dashboard_*.tmp
+
+# Tests + docs aren't needed in the runtime image
+tests/
+docs_to_claude/
+.claude/
+
+# Editor / IDE noise
+.idea/
+.vscode/
+*.swp
