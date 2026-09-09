@@ -5,6 +5,7 @@ This module is pure stdlib; the SDK and the collector both import from here.
 """
 from __future__ import annotations
 
+import os
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -36,11 +37,79 @@ class EventType(str, Enum):
     AGENT_TASK_COMPLETED = "agent.task_completed"
     AGENT_TASK_BLOCKED = "agent.task_blocked"
 
+    # Via record types. Named for what they are so the rollups this integration
+    # exists to serve (cost decomposition, hint provenance, inert-mechanism
+    # detection) are queries against event_type, not string matching inside the
+    # context JSONB blob.
+    VIA_LLM_CALL = "via.llm_call"
+    VIA_GATE = "via.gate"
+    VIA_MILESTONE_STATUS = "via.milestone_status"
+    VIA_STEP = "via.step"
+    VIA_DELEGATION = "via.delegation"
+    VIA_REVIEWER_GATE = "via.reviewer_gate"
+    VIA_BROAD_SWEEP = "via.broad_sweep"
+
     CUSTOM = "custom"
 
 
-VALID_PRODUCTS: set[str] = {"hopwise", "voicewise", "helmerwise", "scriptwise", "agentwise"}
+# The five products PulseWise shipped with. This is the *default*, not the
+# limit: the allowlist is read from the PULSEWISE_VALID_PRODUCTS env var so
+# admitting a new client is a config change rather than an upstream code
+# change. See get_valid_products().
+DEFAULT_VALID_PRODUCTS: frozenset[str] = frozenset(
+    {"hopwise", "voicewise", "helmerwise", "scriptwise", "agentwise"}
+)
+
+VALID_PRODUCTS_ENV_VAR = "PULSEWISE_VALID_PRODUCTS"
+
+# Bounded by pulse_events.product VARCHAR(32) in migrations/001_initial_schema.sql.
+# A name longer than this would be admitted here and then fail at INSERT, so it
+# is rejected at config-load time instead.
+MAX_PRODUCT_NAME_LENGTH = 32
+
 VALID_OUTCOMES: set[str] = {"success", "failure", "ignored", "retry"}
+
+
+def get_valid_products() -> frozenset[str]:
+    """The product allowlist, from PULSEWISE_VALID_PRODUCTS if set.
+
+    Format is a comma-separated list, e.g. "voicewise,hopwise,via". Entries are
+    stripped and lowercased; blanks are ignored. An unset or all-blank value
+    falls back to DEFAULT_VALID_PRODUCTS, so existing deployments that set
+    nothing keep the exact Phase 1 behaviour.
+
+    Read on every call rather than cached: tests and the collector may change
+    the environment at runtime, and this is a set-membership check on a request
+    path that already does network and database I/O.
+    """
+    raw = os.getenv(VALID_PRODUCTS_ENV_VAR)
+    if raw is None:
+        return DEFAULT_VALID_PRODUCTS
+
+    names = {part.strip().lower() for part in raw.split(",")}
+    names.discard("")
+    if not names:
+        return DEFAULT_VALID_PRODUCTS
+
+    oversized = sorted(n for n in names if len(n) > MAX_PRODUCT_NAME_LENGTH)
+    if oversized:
+        raise ValueError(
+            f"{VALID_PRODUCTS_ENV_VAR} contains name(s) longer than "
+            f"{MAX_PRODUCT_NAME_LENGTH} characters: {', '.join(oversized)}"
+        )
+    return frozenset(names)
+
+
+def __getattr__(name: str):
+    """Module-level fallback so `VALID_PRODUCTS` stays a live, public name.
+
+    It was a module constant in Phase 1 and is re-exported from `core` and
+    `pulsewise`. Resolving it here keeps those imports working while making the
+    value reflect the current environment rather than import-time state.
+    """
+    if name == "VALID_PRODUCTS":
+        return get_valid_products()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def _new_event_id() -> str:
@@ -106,7 +175,7 @@ def validate_event(event: PulseEvent) -> list[str]:
     """Returns list of validation error messages. Empty list = valid."""
     errors: list[str] = []
 
-    if event.product not in VALID_PRODUCTS:
+    if event.product not in get_valid_products():
         errors.append(f"Unknown product: {event.product}")
 
     if event.confidence is not None and not 0.0 <= event.confidence <= 1.0:
