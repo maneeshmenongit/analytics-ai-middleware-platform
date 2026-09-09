@@ -45,10 +45,36 @@ consumer latency during PulseWise outages.
 | Module | Purpose |
 |---|---|
 | `core/event_schema.py` | Canonical `PulseEvent` dataclass + validators (1A) |
+| `core/otel_genai.py` | Pinned OTel GenAI attribute names (semconv v1.41.1) |
 | `ingestion/collector.py` | FastAPI service receiving events, persists to Postgres (1B) |
 | `sdk/python/pulsewise.py` | Python SDK, exposed as the top-level `pulsewise` package (1C) |
 | `aggregation/summarizer.py` | Hourly job: SQL aggregations + 1 Claude call/product → `insights_summary.json` (1D) |
 | `dashboard/` | Static internal dashboard reading `dashboard_data.json` (1E) |
+
+## Admitting a client product
+
+Ingestion rejects any event whose `product` is not on the allowlist. The
+allowlist defaults to the five built-in products and is overridden with a
+comma-separated env var — admitting a new client is a config change, not a code
+change:
+
+```bash
+PULSEWISE_VALID_PRODUCTS=hopwise,voicewise,helmerwise,scriptwise,agentwise,via
+```
+
+Setting the var **replaces** the default rather than extending it, so list every
+product you want admitted. Names are lowercased and capped at 32 characters
+(`pulse_events.product` is `VARCHAR(32)`); a longer name is rejected at config
+load rather than failing later at INSERT.
+
+### OpenTelemetry GenAI attribute names
+
+Call-level AI context uses OTel GenAI attribute names (`gen_ai.request.model`,
+`gen_ai.usage.input_tokens`, `gen_ai.provider.name`, …) so clients emit
+vendor-neutral keys. These are **pinned to semantic conventions v1.41.1** and
+defined in `core/otel_genai.py` — that module explains why this version and when
+to revisit. PulseWise adopts the names only; there is no OpenTelemetry
+dependency.
 
 ## Hard constraints
 

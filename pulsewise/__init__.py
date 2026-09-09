@@ -26,10 +26,11 @@ from sdk.python.pulsewise import (
     PulseClient,
 )
 from core.event_schema import (
+    DEFAULT_VALID_PRODUCTS,
     EventType,
     PulseEvent,
     VALID_OUTCOMES,
-    VALID_PRODUCTS,
+    get_valid_products,
     validate_event,
 )
 
@@ -40,10 +41,23 @@ __all__ = [
     "EventType",
     "PulseEvent",
     "validate_event",
+    "get_valid_products",
+    "DEFAULT_VALID_PRODUCTS",
     "VALID_PRODUCTS",
     "VALID_OUTCOMES",
     "DEFAULT_FAILURE_THRESHOLD",
     "DEFAULT_COOLDOWN_SECONDS",
 ]
+
+def __getattr__(name: str):
+    """Keep `VALID_PRODUCTS` live rather than snapshotting it at import time.
+
+    The allowlist is read from PULSEWISE_VALID_PRODUCTS; binding it here would
+    freeze whatever the environment held when the consumer first imported us.
+    """
+    if name == "VALID_PRODUCTS":
+        return get_valid_products()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __version__ = "0.1.0"
