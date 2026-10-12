@@ -15,6 +15,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional, Union
+from urllib.parse import urlsplit
 
 import psycopg
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -22,7 +23,7 @@ from fastapi.responses import JSONResponse
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
-from core.event_schema import PulseEvent, validate_event
+from core.event_schema import PulseEvent, get_valid_products, validate_event
 from ingestion.db import apply_migrations, healthcheck, make_pool
 
 logger = logging.getLogger("pulsewise.collector")
@@ -131,10 +132,21 @@ def _row_to_dict(row, columns: list[str]) -> dict[str, Any]:
     return out
 
 
+def _database_name_from_url(url: str) -> str:
+    """Extract the bare database NAME from a connection URL. Never returns the
+    URL, a user, a password, or an '@'."""
+    try:
+        return urlsplit(url).path.lstrip("/")
+    except Exception:
+        return ""
+
+
 def create_app(database_url: Optional[str] = None, run_migrations: bool = True) -> FastAPI:
     db_url = database_url or os.getenv("DATABASE_URL")
     if not db_url:
         raise RuntimeError("DATABASE_URL not set and no database_url passed to create_app")
+
+    db_name = _database_name_from_url(db_url)
 
     if run_migrations:
         apply_migrations(db_url)
@@ -198,7 +210,12 @@ def create_app(database_url: Optional[str] = None, run_migrations: bool = True) 
         status = "ok" if ok else "degraded"
         return JSONResponse(
             status_code=200 if ok else 503,
-            content={"status": status, "db": ok},
+            content={
+                "status": status,
+                "db": ok,
+                "database": db_name,
+                "products": sorted(get_valid_products()),
+            },
         )
 
     @app.get("/events/recent")
