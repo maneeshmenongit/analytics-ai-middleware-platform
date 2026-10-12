@@ -6,6 +6,7 @@ This module is pure stdlib; the SDK and the collector both import from here.
 from __future__ import annotations
 
 import os
+import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -48,6 +49,8 @@ class EventType(str, Enum):
     VIA_DELEGATION = "via.delegation"
     VIA_REVIEWER_GATE = "via.reviewer_gate"
     VIA_BROAD_SWEEP = "via.broad_sweep"
+    VIA_HINT = "via.hint"
+    VIA_INSTRUMENT = "via.instrument"
 
     CUSTOM = "custom"
 
@@ -68,6 +71,34 @@ VALID_PRODUCTS_ENV_VAR = "PULSEWISE_VALID_PRODUCTS"
 MAX_PRODUCT_NAME_LENGTH = 32
 
 VALID_OUTCOMES: set[str] = {"success", "failure", "ignored", "retry"}
+
+# pulse_events.event_type is VARCHAR(64); see migrations/001_initial_schema.sql.
+MAX_EVENT_TYPE_LENGTH = 64
+
+# Column limits for the remaining VARCHAR fields, per migrations/001_initial_schema.sql
+# and migrations/002_widen_session_id.sql (session_id was widened there). A value
+# longer than its column's limit is rejected here rather than failing at INSERT.
+MAX_SESSION_ID_LENGTH = 255
+MAX_USER_ID_LENGTH = 64
+MAX_MODEL_NAME_LENGTH = 64
+MAX_MODEL_PROVIDER_LENGTH = 32
+MAX_ERROR_CODE_LENGTH = 64
+
+# field name -> (attribute, max length). Used by validate_event's length checks.
+_LENGTH_LIMITS: tuple[tuple[str, int], ...] = (
+    ("session_id", MAX_SESSION_ID_LENGTH),
+    ("user_id", MAX_USER_ID_LENGTH),
+    ("model_name", MAX_MODEL_NAME_LENGTH),
+    ("model_provider", MAX_MODEL_PROVIDER_LENGTH),
+    ("error_code", MAX_ERROR_CODE_LENGTH),
+)
+
+# The <name> portion of a namespaced `<product>.<name>` event_type.
+_NAMESPACE_NAME_RE = re.compile(r"^[a-z0-9_]+$")
+
+# All EventType values, computed once at import time (the member set is fixed
+# at import; this is not environment-dependent like get_valid_products()).
+_EVENT_TYPE_VALUES: frozenset[str] = frozenset(member.value for member in EventType)
 
 
 def get_valid_products() -> frozenset[str]:
@@ -171,6 +202,24 @@ class PulseEvent:
         }
 
 
+def _is_valid_event_type(event_type: str, product: str) -> bool:
+    """True iff event_type is an EventType value (any product), or
+    `<product>.<name>` where `<product>` is this event's OWN product and
+    `<name>` matches [a-z0-9_]+, with the whole string at most
+    MAX_EVENT_TYPE_LENGTH characters."""
+    if not event_type or len(event_type) > MAX_EVENT_TYPE_LENGTH:
+        return False
+
+    if event_type in _EVENT_TYPE_VALUES:
+        return True
+
+    prefix = f"{product}."
+    if not event_type.startswith(prefix):
+        return False
+    name = event_type[len(prefix):]
+    return bool(_NAMESPACE_NAME_RE.match(name))
+
+
 def validate_event(event: PulseEvent) -> list[str]:
     """Returns list of validation error messages. Empty list = valid."""
     errors: list[str] = []
@@ -196,7 +245,31 @@ def validate_event(event: PulseEvent) -> list[str]:
     if not event.session_id:
         errors.append("session_id is required")
 
+    # Length checks against each field's VARCHAR column limit. A value exactly
+    # AT the limit is accepted; anything longer is rejected with an error that
+    # names the field, so the collector can report a per-event rejection
+    # instead of the batch dying at INSERT (StringDataRightTruncation -> 503).
+    for attr_name, limit in _LENGTH_LIMITS:
+        value = getattr(event, attr_name)
+        if value is not None and len(value) > limit:
+            errors.append(
+                f"{attr_name} is too long: {len(value)} characters exceeds the "
+                f"{limit}-character limit"
+            )
+
     if not event.event_type:
         errors.append("event_type is required")
+    else:
+        et_value = event.event_type.value if isinstance(event.event_type, EventType) else event.event_type
+        if len(et_value) > MAX_EVENT_TYPE_LENGTH:
+            errors.append(
+                f"event_type is too long: {len(et_value)} characters exceeds the "
+                f"{MAX_EVENT_TYPE_LENGTH}-character limit"
+            )
+        elif not _is_valid_event_type(et_value, event.product):
+            errors.append(
+                f"Invalid event_type: {event.event_type!r} is not a known EventType value and does not match "
+                f"'{event.product}.<name>' ([a-z0-9_]+, max {MAX_EVENT_TYPE_LENGTH} chars)"
+            )
 
     return errors
