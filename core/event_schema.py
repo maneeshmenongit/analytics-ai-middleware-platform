@@ -75,6 +75,24 @@ VALID_OUTCOMES: set[str] = {"success", "failure", "ignored", "retry"}
 # pulse_events.event_type is VARCHAR(64); see migrations/001_initial_schema.sql.
 MAX_EVENT_TYPE_LENGTH = 64
 
+# Column limits for the remaining VARCHAR fields, per migrations/001_initial_schema.sql
+# and migrations/002_widen_session_id.sql (session_id was widened there). A value
+# longer than its column's limit is rejected here rather than failing at INSERT.
+MAX_SESSION_ID_LENGTH = 255
+MAX_USER_ID_LENGTH = 64
+MAX_MODEL_NAME_LENGTH = 64
+MAX_MODEL_PROVIDER_LENGTH = 32
+MAX_ERROR_CODE_LENGTH = 64
+
+# field name -> (attribute, max length). Used by validate_event's length checks.
+_LENGTH_LIMITS: tuple[tuple[str, int], ...] = (
+    ("session_id", MAX_SESSION_ID_LENGTH),
+    ("user_id", MAX_USER_ID_LENGTH),
+    ("model_name", MAX_MODEL_NAME_LENGTH),
+    ("model_provider", MAX_MODEL_PROVIDER_LENGTH),
+    ("error_code", MAX_ERROR_CODE_LENGTH),
+)
+
 # The <name> portion of a namespaced `<product>.<name>` event_type.
 _NAMESPACE_NAME_RE = re.compile(r"^[a-z0-9_]+$")
 
@@ -227,15 +245,31 @@ def validate_event(event: PulseEvent) -> list[str]:
     if not event.session_id:
         errors.append("session_id is required")
 
+    # Length checks against each field's VARCHAR column limit. A value exactly
+    # AT the limit is accepted; anything longer is rejected with an error that
+    # names the field, so the collector can report a per-event rejection
+    # instead of the batch dying at INSERT (StringDataRightTruncation -> 503).
+    for attr_name, limit in _LENGTH_LIMITS:
+        value = getattr(event, attr_name)
+        if value is not None and len(value) > limit:
+            errors.append(
+                f"{attr_name} is too long: {len(value)} characters exceeds the "
+                f"{limit}-character limit"
+            )
+
     if not event.event_type:
         errors.append("event_type is required")
-    elif not _is_valid_event_type(
-        event.event_type.value if isinstance(event.event_type, EventType) else event.event_type,
-        event.product,
-    ):
-        errors.append(
-            f"Invalid event_type: {event.event_type!r} is not a known EventType value and does not match "
-            f"'{event.product}.<name>' ([a-z0-9_]+, max {MAX_EVENT_TYPE_LENGTH} chars)"
-        )
+    else:
+        et_value = event.event_type.value if isinstance(event.event_type, EventType) else event.event_type
+        if len(et_value) > MAX_EVENT_TYPE_LENGTH:
+            errors.append(
+                f"event_type is too long: {len(et_value)} characters exceeds the "
+                f"{MAX_EVENT_TYPE_LENGTH}-character limit"
+            )
+        elif not _is_valid_event_type(et_value, event.product):
+            errors.append(
+                f"Invalid event_type: {event.event_type!r} is not a known EventType value and does not match "
+                f"'{event.product}.<name>' ([a-z0-9_]+, max {MAX_EVENT_TYPE_LENGTH} chars)"
+            )
 
     return errors
