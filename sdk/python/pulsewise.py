@@ -18,8 +18,9 @@ import queue
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 import httpx
 
@@ -92,6 +93,29 @@ class _Job:
 _SHUTDOWN = object()
 
 
+def _parse_timestamp(value: Union[str, datetime]) -> datetime:
+    """Parse a caller-supplied timestamp into a tz-aware UTC datetime.
+
+    Accepts a datetime (naive datetimes are read as UTC) or an ISO-8601 string
+    (a trailing 'Z' means UTC; a naive ISO string is read as UTC). Raises
+    ValueError on anything that cannot be read -- the caller (track()) catches
+    this and drops the event rather than propagating it.
+    """
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, str):
+        s = value.strip()
+        if s.endswith("Z") or s.endswith("z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+    else:
+        raise ValueError(f"timestamp must be a datetime or ISO-8601 string, got {type(value).__name__}")
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 class PulseClient:
     def __init__(
         self,
@@ -156,10 +180,24 @@ class PulseClient:
         retry_count: int = 0,
         context: Optional[dict[str, Any]] = None,
         tags: Optional[list[str]] = None,
+        event_id: Optional[str] = None,
+        timestamp: Optional[Union[str, datetime]] = None,
     ) -> bool:
         """Emit an event. Returns True if accepted for delivery, False if dropped.
 
         Never raises. enabled=False is a hard no-op (no event_id minting either).
+
+        event_id, when given, is sent exactly as given (not re-minted); a value
+        that is not a valid UUID string is rejected by validate_event() and the
+        event is dropped.
+
+        timestamp, when given, may be a datetime or an ISO-8601 string (a
+        trailing 'Z' means UTC; a naive value -- datetime or string -- is read
+        as UTC). A timestamp that cannot be parsed (e.g. "yesterday") drops the
+        event: this returns False, nothing is sent, and this never raises.
+
+        When neither is given, today's behaviour is unchanged: a fresh uuid4
+        event_id and the current UTC time.
         """
         if not self.enabled:
             return False
@@ -169,9 +207,17 @@ class PulseClient:
         if not self.circuit.allow_request():
             return False
 
+        parsed_timestamp = None
+        if timestamp is not None:
+            try:
+                parsed_timestamp = _parse_timestamp(timestamp)
+            except (ValueError, TypeError) as exc:
+                logger.warning("pulsewise: dropping event with unparseable timestamp: %s", exc)
+                return False
+
         et = event_type.value if isinstance(event_type, EventType) else str(event_type)
 
-        event = PulseEvent(
+        event_kwargs: dict[str, Any] = dict(
             product=self.product,
             event_type=et,
             session_id=session_id,
@@ -188,6 +234,12 @@ class PulseClient:
             context=context or {},
             tags=tags or [],
         )
+        if event_id is not None:
+            event_kwargs["event_id"] = event_id
+        if parsed_timestamp is not None:
+            event_kwargs["timestamp"] = parsed_timestamp
+
+        event = PulseEvent(**event_kwargs)
 
         errors = validate_event(event)
         if errors:

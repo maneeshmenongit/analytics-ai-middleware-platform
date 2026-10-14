@@ -220,6 +220,17 @@ def _is_valid_event_type(event_type: str, product: str) -> bool:
     return bool(_NAMESPACE_NAME_RE.match(name))
 
 
+def _is_valid_event_id(event_id: Any) -> bool:
+    """True iff event_id is a string that parses as a UUID (any case/version)."""
+    if not isinstance(event_id, str):
+        return False
+    try:
+        uuid.UUID(event_id)
+    except (ValueError, AttributeError, TypeError):
+        return False
+    return True
+
+
 def validate_event(event: PulseEvent) -> list[str]:
     """Returns list of validation error messages. Empty list = valid."""
     errors: list[str] = []
@@ -245,13 +256,25 @@ def validate_event(event: PulseEvent) -> list[str]:
     if not event.session_id:
         errors.append("session_id is required")
 
-    # Length checks against each field's VARCHAR column limit. A value exactly
-    # AT the limit is accepted; anything longer is rejected with an error that
-    # names the field, so the collector can report a per-event rejection
-    # instead of the batch dying at INSERT (StringDataRightTruncation -> 503).
+    if not _is_valid_event_id(event.event_id):
+        errors.append(f"Invalid event_id: {event.event_id!r} is not a UUID string")
+
+    # Length / type checks against each field's VARCHAR column limit. A value
+    # exactly AT the limit is accepted; anything longer is rejected with an
+    # error that names the field, so the collector can report a per-event
+    # rejection instead of the batch dying at INSERT (StringDataRightTruncation
+    # -> 503). A non-string value in one of these fields is also rejected here,
+    # named by field, rather than raising when len() is applied to it.
     for attr_name, limit in _LENGTH_LIMITS:
         value = getattr(event, attr_name)
-        if value is not None and len(value) > limit:
+        if value is None:
+            continue
+        if not isinstance(value, str):
+            errors.append(
+                f"{attr_name} must be a string, got {type(value).__name__}: {value!r}"
+            )
+            continue
+        if len(value) > limit:
             errors.append(
                 f"{attr_name} is too long: {len(value)} characters exceeds the "
                 f"{limit}-character limit"
