@@ -12,7 +12,7 @@ import json
 import logging
 import os
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional, Union
 from urllib.parse import urlsplit
@@ -29,6 +29,75 @@ from ingestion.db import apply_migrations, healthcheck, make_pool
 logger = logging.getLogger("pulsewise.collector")
 
 MAX_BATCH_SIZE = 100
+
+# m3 — unmarked-event time guard (Insight v4 F11 / S1 decision D6).
+#
+# Tags that exempt an event from the guard entirely: it is stored with the
+# time it sent, whatever it is.
+_TIME_GUARD_EXEMPT_TAGS = frozenset({"source:synthetic", "via-source:backfill"})
+
+# Window width around the request's receive time. An unmarked event's
+# timestamp must land in [received - _TIME_GUARD_PAST, received + _TIME_GUARD_FUTURE]
+# or it is clamped to `received`.
+_TIME_GUARD_PAST = timedelta(days=7)
+_TIME_GUARD_FUTURE = timedelta(minutes=5)
+
+_CLAMP_TAG = "timestamp-clamped"
+_ORIGINAL_TIMESTAMP_CONTEXT_KEY = "pulsewise.original_timestamp"
+
+
+def _as_utc(ts: datetime) -> datetime:
+    """A tz-aware instant in UTC. A naive datetime is read as UTC (never
+    local time), matching the module contract's declared scale."""
+    if ts.tzinfo is None:
+        return ts.replace(tzinfo=timezone.utc)
+    return ts.astimezone(timezone.utc)
+
+
+def _apply_time_guard(event: PulseEvent, received: datetime) -> None:
+    """Clamp `event` in place if it is unmarked and its timestamp falls
+    outside the window around `received`. `received` must already be a
+    tz-aware UTC instant.
+
+    An event tagged source:synthetic or via-source:backfill is left
+    untouched: it is stored with the time it sent, whatever it is.
+
+    Otherwise: if event.timestamp (naive read as UTC) is within
+    [received - 7 days, received + 5 minutes], nothing changes -- in
+    particular, an in-window naive timestamp is stored exactly as it is
+    today (this function does not touch event.timestamp in that case).
+
+    Outside that window, the event is clamped: event.timestamp becomes
+    `received`, "timestamp-clamped" is appended to event.tags (the sender's
+    tags are kept), and the original time is recorded as an ISO-8601 string
+    under context["pulsewise.original_timestamp"] (the sender's context keys
+    are kept).
+    """
+    tags = event.tags or []
+    if any(t in _TIME_GUARD_EXEMPT_TAGS for t in tags):
+        return
+
+    original = event.timestamp
+    if original is None:
+        return
+
+    normalized = _as_utc(original)
+    lower = received - _TIME_GUARD_PAST
+    upper = received + _TIME_GUARD_FUTURE
+    if lower <= normalized <= upper:
+        return
+
+    # Outside the window: clamp. Preserve the sender's tags/context exactly,
+    # only adding to them.
+    original_iso = normalized.isoformat()
+    event.timestamp = received
+    new_tags = list(tags)
+    if _CLAMP_TAG not in new_tags:
+        new_tags.append(_CLAMP_TAG)
+    event.tags = new_tags
+    new_context = dict(event.context or {})
+    new_context[_ORIGINAL_TIMESTAMP_CONTEXT_KEY] = original_iso
+    event.context = new_context
 
 
 def _parse_event(payload: dict[str, Any]) -> tuple[Optional[PulseEvent], list[str]]:
@@ -163,6 +232,8 @@ def create_app(database_url: Optional[str] = None, run_migrations: bool = True) 
 
     @app.post("/events")
     async def post_events(request: Request):
+        received = datetime.now(timezone.utc)
+
         try:
             body = await request.json()
         except json.JSONDecodeError as exc:
@@ -190,6 +261,7 @@ def create_app(database_url: Optional[str] = None, run_migrations: bool = True) 
             if event is None:
                 errors.append({"index": idx, "errors": errs})
             else:
+                _apply_time_guard(event, received)
                 valid.append(event)
 
         try:
